@@ -10,7 +10,14 @@ option go_package = "github.com/substrait-io/substrait-go/proto";
 option java_multiple_files = true;
 option java_package = "io.substrait.proto";
 
+// 在 Apache Gluten 项目中，这段代码同样出自 Substrait 协议 的 Protobuf 定义文件。Type 消息是 Substrait 系统中的类型系统核心。
+// Type 的核心作用是统一定义数据在 Java 层（Spark）和 Native 层（Velox/ClickHouse）之间传输时的类型规范。
+// 由于 Spark 拥有自己的类型系统（如 IntegerType, StringType），而底层 C++ 后端也有自己的物理内存表示（如 int32_t, std::string），Substrait 的 Type 充当了两者之间的通用语言（Common Language）：
+// 元数据定义：它描述了每一个字段的数据格式、是否允许为空（Nullability）以及类型精度。
+// 跨平台映射：Gluten 将 Spark 的 StructType 模式转换为 Substrait 的 Type.Struct 树，从而让底层引擎知道如何解析内存二进制数据。
+// Type 消息由一个核心容器 kind（类型种类）、一个全局枚举 Nullability 和多个具体的类型子消息组成。
 message Type {
+  // 决定了当前 Type 实例具体属于哪种类型。涵盖了所有主流的数据类型：
   oneof kind {
     Boolean bool = 1;
     I8 i8 = 2;
@@ -48,19 +55,22 @@ message Type {
 
     Nothing nothing = 33;
   }
-
+  // 定义了该字段处理 NULL 值的约束：
   enum Nullability {
-    NULLABILITY_UNSPECIFIED = 0;
-    NULLABILITY_NULLABLE = 1;
-    NULLABILITY_REQUIRED = 2;
+    NULLABILITY_UNSPECIFIED = 0;  // 未指定。通常由系统默认处理。
+    NULLABILITY_NULLABLE = 1; // 允许包含 NULL 值。
+    NULLABILITY_REQUIRED = 2; // 必填项，不允许为 NULL。Native 后端可以根据此信息进行性能优化（如跳过 Null 判断）。
   }
 
   message Nothing {
+    // 引用计划头部定义的“类型变体”。
+    // 作用：允许在不改变物理布局的情况下改变语义。例如，同样是 I32，可以指定一种变体表示它是特定的枚举或逻辑标记。
     uint32 type_variation_reference = 1;
   }
 
   message Boolean {
     uint32 type_variation_reference = 1;
+    // 指定该类型的可空状态（见上文枚举）。
     Nullability nullability = 2;
   }
 
@@ -229,15 +239,23 @@ message Type {
 //
 // * Only struct fields are contained in this field's elements,
 // * Map keys should be traversed first, then values when producing/consuming
+// NamedStruct 同样源自 Substrait 协议 的 Protobuf 定义。它不仅定义了数据的结构（Schema），还解决了数据列在逻辑上如何被“命名”以及其“属性分类”的问题。
+// NamedStruct 的核心作用是完整地定义一个关系（Relation）的输出模式（Schema）。
+// 在 Substrait 计划中，虽然 Type.Struct 负责定义字段的物理类型，但它通常不直接包含字段名。NamedStruct 将物理类型树与展平的名字列表结合在一起。
+// 列命名：通过 DFS（深度优先搜索）顺序映射，为复杂的嵌套结构提供字段名。
+// 列属性标注：在 Gluten 这种大数据集成场景下，它还负责标注哪些列是原始数据列，哪些是分区列或元数据列，这对文件扫描（Scan）阶段至关重要。
 message NamedStruct {
   // list of names in dfs order
+  // 存储 Schema 中所有字段的名称列表。
   repeated string names = 1;
+  // 定义 Schema 的物理数据类型结构。
   Type.Struct struct = 2;
+  // 标注每一列的物理来源或功能类型。
   repeated ColumnType column_types = 3;
   enum ColumnType {
-    NORMAL_COL = 0;
-    PARTITION_COL = 1;
-    METADATA_COL = 2;
-    ROWINDEX_COL = 3;
+    NORMAL_COL = 0; // 普通数据列。存在于原始数据文件中。
+    PARTITION_COL = 1; // 分区列。例如 Hive 表中按 year/month 分区的路径信息。
+    METADATA_COL = 2; // 元数据列。例如文件路径、行号等隐藏信息。
+    ROWINDEX_COL = 3; // 行索引列。专门用于记录行在文件中的原始位置，常用于实现索引加速或二级扫描。
   }
 }

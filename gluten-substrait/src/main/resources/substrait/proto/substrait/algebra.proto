@@ -527,16 +527,23 @@ message RelRoot {
 }
 
 // A relation (used internally in a plan)
+// 在 Apache Gluten 项目中，这段代码同样属于 Substrait 协议 的 Protobuf 定义。
+// Rel 是 Relation（关系算子） 的缩写，它是 Substrait 计划中构建执行流水线（Pipeline）的最基本单元。
+// Rel 的核心作用是作为所有关系算子的通用容器。
+// 在数据库理论中，SQL 查询会被解析为一棵关系代数树。树上的每个节点（如过滤、连接、聚合）都是一个 Rel。
+// 统一抽象：通过 oneof 包装，Rel 允许 Substrait 在计划中使用统一的类型来代表各种不同的操作。
+// 递归构建：大部分 Rel 内部都会包含一个输入字段（通常名为 input），其类型也是 Rel。这种递归结构最终形成了一棵完整的算子执行树。
+// 跨平台指令：Gluten 将 Spark 的物理算子（如 HashAggregateExec）转换为对应的 Rel（如 AggregateRel），发送给 Native 后端执行。
 message Rel {
   oneof rel_type {
-    ReadRel read = 1;
-    FilterRel filter = 2;
-    FetchRel fetch = 3;
-    AggregateRel aggregate = 4;
-    SortRel sort = 5;
-    JoinRel join = 6;
-    ProjectRel project = 7;
-    SetRel set = 8;
+    ReadRel read = 1; // 负责读取数据源（如 Parquet 文件、内存中的本地数据等）。
+    FilterRel filter = 2; // 对应 SQL 的 WHERE 或 HAVING，根据谓词条件过滤行。
+    FetchRel fetch = 3; // 对应 LIMIT 和 OFFSET，用于截取结果集的一部分。
+    AggregateRel aggregate = 4; // 执行分组聚合操作（如 GROUP BY, SUM, AVG）。
+    SortRel sort = 5; // 执行全局排序或分区排序。
+    JoinRel join = 6; // 辑连接算子，涵盖 Inner, Left, Right, Full Outer 等。
+    ProjectRel project = 7; // 对应 SELECT 字段选择或表达式计算（如 a + b）。
+    SetRel set = 8; // 集合操作，如 UNION, INTERSECT, EXCEPT。
     ExtensionSingleRel extension_single = 9;
     ExtensionMultiRel extension_multi = 10;
     ExtensionLeafRel extension_leaf = 11;
@@ -755,20 +762,29 @@ message FunctionOption {
   // match one of the option values defined for the option.
   repeated string preference = 2;
 }
+// 在 Apache Gluten 项目中，Expression 消息同样遵循 Substrait 协议。它是计算逻辑的最小构建单元，负责描述如何对数据进行运算、转换或提取。
+// 如果说 Rel（关系算子）定义了数据的流向，那么 Expression 就定义了在流转过程中对数据进行的“具体手术”。
+// Expression 的核心作用是以标准化的方式描述数据处理逻辑。
+// 在 Spark 物理计划中，每个算子内部都包含大量的表达式（如 Add, CaseWhen, AttributeReference）。Gluten 的任务就是将这些 Spark 表达式翻译成 Substrait 的 Expression。
+// 计算载体：描述加减乘除、字符串处理、函数调用等。
+// 数据引用：描述如何从内存行中提取特定的列。
+// 逻辑控制：描述分支判断（IF-THEN）和子查询。
 
 message Expression {
+  // 核心类型容器
+  // 定义了表达式的具体表现形式：
   oneof rex_type {
-    Literal literal = 1;
-    FieldReference selection = 2;
-    ScalarFunction scalar_function = 3;
-    WindowFunction window_function = 5;
-    IfThen if_then = 6;
-    SwitchExpression switch_expression = 7;
-    SingularOrList singular_or_list = 8;
+    Literal literal = 1; // 常量值（如数字 10, 字符串 "apple"）。
+    FieldReference selection = 2; // 字段引用。指定从当前输入的记录中取哪一列。
+    ScalarFunction scalar_function = 3; // 标量函数。输入一行，输出一行（如 substring, abs）。
+    WindowFunction window_function = 5; // 窗口函数（如 ROW_NUMBER(), RANK()）。
+    IfThen if_then = 6; // 逻辑判断。对应 SQL 的 CASE WHEN ... THEN ... ELSE。
+    SwitchExpression switch_expression = 7; // 开关表达式。对某个值进行多等值匹配。
+    SingularOrList singular_or_list = 8; // 对应 SQL 的 IN (value1, value2)。
     MultiOrList multi_or_list = 9;
-    Cast cast = 11;
-    Subquery subquery = 12;
-    Nested nested = 13;
+    Cast cast = 11; // 类型转换。将数据从一种类型转为另一种（如 String 转 Int）。
+    Subquery subquery = 12; // 子查询表达式（如 EXISTS, IN (SELECT ...)）。
+    Nested nested = 13; // 嵌套类型构造。用于动态生成结构体（Struct）、列表（List）或映射（Map）。
 
     // deprecated: enum literals are only sensible in the context of
     // function arguments, for which FunctionArgument should now be
@@ -788,8 +804,9 @@ message Expression {
       option deprecated = true;
     }
   }
-
+  // 字面量/常量
   message Literal {
+    // 包含所有基础类型（i32, string, decimal 等）和复杂类型（struct, map）的实际数值。
     oneof literal_type {
       bool boolean = 1;
       int32 i8 = 2;

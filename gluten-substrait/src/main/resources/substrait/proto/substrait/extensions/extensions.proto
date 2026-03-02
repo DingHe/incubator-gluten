@@ -22,49 +22,69 @@ message SimpleExtensionURI {
 
 // Describes a mapping between a specific extension entity and the uri where
 // that extension can be found.
+// SimpleExtensionDeclaration 的核心作用是声明计划中使用的扩展实体（类型、类型变体或函数）与外部定义（YAML 文件）之间的映射关系。
+// 由于 Substrait 旨在跨语言、跨引擎，它不能硬编码所有函数（如 plus, substring）。因此，它使用“扩展（Extensions）”机制：
+// 在计划的头部定义这些函数来自哪个 URI（通常是一个包含函数签名的 YAML 文件）。
+// 使用 SimpleExtensionDeclaration 为这些实体分配一个锚点 ID（Anchor ID）。
+// 在具体的执行计划（RelNode）中，不再使用字符串名称，而是直接使用这个数字 ID。
 message SimpleExtensionDeclaration {
+  // 表示一次声明只能是以下三种类型之一：
   oneof mapping_type {
-    ExtensionType extension_type = 1;
-    ExtensionTypeVariation extension_type_variation = 2;
-    ExtensionFunction extension_function = 3;
+    ExtensionType extension_type = 1; // 自定义数据类型。
+    ExtensionTypeVariation extension_type_variation = 2; // 现有类型的变体（例如：带精度损失的数值类型）。
+    ExtensionFunction extension_function = 3; // 自定义函数（这是 Gluten 中最常用的部分）。
   }
 
   // Describes a Type
+  // 自定义类型声明
+  // 用于定义 Substrait 标准类型以外的特殊类型。
   message ExtensionType {
     // references the extension_uri_anchor defined for a specific extension URI.
+    // 引用计划中定义的 ExtensionUri 的索引 ID。它指向类型定义所在的 YAML 文件路径。
     uint32 extension_uri_reference = 1;
 
     // A surrogate key used in the context of a single plan to reference a
     // specific extension type
+    // 在当前计算计划（Plan）内的代理键（Surrogate Key）。它是该类型的局部唯一 ID。
     uint32 type_anchor = 2;
 
     // the name of the type in the defined extension YAML.
+    // 在 YAML 扩展文件中定义的该类型的原始名称。
     string name = 3;
   }
-
+  // 类型变体声明
   message ExtensionTypeVariation {
     // references the extension_uri_anchor defined for a specific extension URI.
+    // 同上，指向定义变体的 URI。
     uint32 extension_uri_reference = 1;
 
     // A surrogate key used in the context of a single plan to reference a
     // specific type variation
+    // 在当前计划内引用该特定类型变体的 ID。
     uint32 type_variation_anchor = 2;
 
     // the name of the type in the defined extension YAML.
+    // 变体在 YAML 文件中的名称。
     string name = 3;
   }
-
+  // 扩展函数声明
+  // 这是 Gluten 转换逻辑的核心。每当 Spark 调用一个函数（如 Add, Lower），Gluten 都会生成一个这样的声明。
   message ExtensionFunction {
     // references the extension_uri_anchor defined for a specific extension URI.
+    // 指向包含该函数定义的 YAML 文件的引用 ID。
     uint32 extension_uri_reference = 1;
 
     // A surrogate key used in the context of a single plan to reference a
     // specific function
+    // 这是该函数在当前 Plan 中的 ID。例如，在转换过程中，Gluten 将 plus 函数映射为 function_anchor = 1。后续所有的 ScalarFunction 节点都会持有 1 这个数字。
     uint32 function_anchor = 2;
 
     // A simple name if there is only one impl for the function within the YAML.
     // A compound name, referencing that includes type short names if there is
     // more than one impl per name in the YAML.
+    // 函数的名称。
+    // 简单名称：如果 YAML 中该函数只有一个实现。
+    // 复合名称：如果存在重载（Overload），名称会包含类型简写（例如 add:i32_i32），以确保 Native 引擎能准确找到对应的 C++ 实现。
     string name = 3;
   }
 }

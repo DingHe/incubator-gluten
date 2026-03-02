@@ -20,7 +20,11 @@ import io.substrait.proto.Type;
 
 import java.io.Serializable;
 
+// TypeNode 是 Java 层用于描述数据类型的核心抽象基类。它作为 Spark DataType 到 Substrait Type 协议之间的转换桥梁。
+// TypeNode 的主要作用是在 Java 内存中构建一套类型描述体系。
+// 由于 Gluten 需要将 Spark 的物理执行计划序列化为 Substrait 协议格式，而直接操作 Protobuf 生成的 io.substrait.proto.Type 类非常繁琐且不具备面向对象的灵活性，因此 Gluten 设计了 TypeNode 及其子类：
 public abstract class TypeNode implements Serializable {
+  // 标记该数据类型是否允许包含 null 值。
   protected final Boolean nullable;
 
   protected TypeNode(Boolean nullable) {
