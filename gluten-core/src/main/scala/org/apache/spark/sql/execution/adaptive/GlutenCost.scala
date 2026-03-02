@@ -20,6 +20,8 @@ import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.SparkPlan
 
 /** Since https://github.com/apache/incubator-gluten/pull/6143. */
+// 在 Apache Gluten 项目中，GlutenCost 是对 Spark AQE 成本比较机制的底层重写。
+// 它的核心逻辑非常精妙：在逻辑等价的情况下，通过比较计划的 ID，人为地让“更新”生成的计划（通常是 Gluten 转换后的计划）胜出。
 class GlutenCost(val eval: CostEvaluator, val plan: SparkPlan) extends Cost {
   override def compare(that: Cost): Int = that match {
     case that: GlutenCost if plan eq that.plan =>

@@ -52,6 +52,13 @@ import java.util.{ArrayList => JArrayList, List => JList}
 
 import scala.collection.JavaConverters._
 
+// SparkPlanExecApi 是 Apache Gluten 架构中的物理执行层转换接口。
+// 它定义了如何将原生的 SparkPlan（物理算子）和 Expression（表达式）映射并转换为 Gluten 的 Transformer 算子。
+// 简单来说，当 Gluten 决定将某个查询下推到 Native 引擎时，它会调用这个 API 来创建对应的“翻译算子”。
+// 算子翻译工厂：它是生成各类 ExecTransformer（如 FilterExecTransformer）的工厂类。
+// 屏蔽后端差异：不同的计算后端（Velox, ClickHouse）对算子的实现细节不同（例如 Join 的实现、聚合的逻辑）。SparkPlanExecApi 允许后端注入自己特有的转换逻辑。
+// 连接 Spark 与 Substrait：它负责提取 Spark 算子中的元数据（如 Key、Condition、Schema），并为后续生成 Substrait 计划做好准备。
+// Shuffle 与 Exchange 管理：定义了列式 Shuffle（Columnar Shuffle）的依赖生成、序列化及读写器的创建。
 trait SparkPlanExecApi {
 
   /**
@@ -64,6 +71,7 @@ trait SparkPlanExecApi {
    * @return
    *   the transformer of FilterExec
    */
+  // 生成过滤（Filter）和投影（Project）的转换器。这是 SQL 执行中最基础的两个算子。
   def genFilterExecTransformer(condition: Expression, child: SparkPlan): FilterExecTransformerBase
 
   def genProjectExecTransformer(
@@ -72,6 +80,7 @@ trait SparkPlanExecApi {
     ProjectExecTransformer.createUnsafe(projectList, child)
 
   /** Generate HashAggregateExecTransformer. */
+  // 生成基于哈希的聚合算子。它处理分组表达式（Grouping）和聚合函数（Aggregate Expressions）。
   def genHashAggregateExecTransformer(
       requiredChildDistributionExpressions: Option[Seq[Expression]],
       groupingExpressions: Seq[NamedExpression],
@@ -82,13 +91,15 @@ trait SparkPlanExecApi {
       child: SparkPlan): HashAggregateExecBaseTransformer
 
   /** Generate HashAggregateExecPullOutHelper */
+  // 辅助方法。由于 Native 聚合后的属性可能需要重新映射回 Spark 识别的属性，该 Helper 负责这种属性的“拉出”逻辑。
   def genHashAggregateExecPullOutHelper(
       aggregateExpressions: Seq[AggregateExpression],
       aggregateAttributes: Seq[Attribute]): HashAggregateExecPullOutBaseHelper
-
+  // 将 Spark 的 ShuffleExchangeExec 替换为 Gluten 的列式版本。
   def genColumnarShuffleExchange(shuffle: ShuffleExchangeExec): SparkPlan
 
   /** Generate ShuffledHashJoinExecTransformer. */
+  // 生成混合哈希连接（SHJ）转换器。
   def genShuffledHashJoinExecTransformer(
       leftKeys: Seq[Expression],
       rightKeys: Seq[Expression],
@@ -100,6 +111,7 @@ trait SparkPlanExecApi {
       isSkewJoin: Boolean): ShuffledHashJoinExecTransformerBase
 
   /** Generate BroadcastHashJoinExecTransformer. */
+  // 生成广播哈希连接（BHJ）转换器。
   def genBroadcastHashJoinExecTransformer(
       leftKeys: Seq[Expression],
       rightKeys: Seq[Expression],
@@ -118,6 +130,7 @@ trait SparkPlanExecApi {
       child: SparkPlan): SampleExecTransformer
 
   /** Generate ShuffledHashJoinExecTransformer. */
+  // 生成排序归并连接（SMJ）转换器。
   def genSortMergeJoinExecTransformer(
       leftKeys: Seq[Expression],
       rightKeys: Seq[Expression],
@@ -140,7 +153,7 @@ trait SparkPlanExecApi {
       buildSide: BuildSide,
       joinType: JoinType,
       condition: Option[Expression]): BroadcastNestedLoopJoinExecTransformer
-
+  // 处理别名（Alias）。
   def genAliasTransformer(
       substraitExprName: String,
       child: ExpressionTransformer,
@@ -148,6 +161,7 @@ trait SparkPlanExecApi {
     AliasTransformer(substraitExprName, child, original)
 
   /** Generate an expression transformer to transform GetMapValue to Substrait. */
+  // 处理复杂类型（数组、映射）的取值。
   def genGetMapValueTransformer(
       substraitExprName: String,
       left: ExpressionTransformer,
@@ -190,6 +204,7 @@ trait SparkPlanExecApi {
   }
 
   /** Transform GetArrayItem to Substrait. */
+  // 处理复杂类型（数组、映射）的取值。
   def genGetArrayItemTransformer(
       substraitExprName: String,
       left: ExpressionTransformer,
@@ -231,7 +246,7 @@ trait SparkPlanExecApi {
       original: TryEval): ExpressionTransformer = {
     throw new GlutenNotSupportException(s"try_eval(${original.child.prettyName}) is not supported")
   }
-
+  // 处理算术运算。
   def genArithmeticTransformer(
       substraitExprName: String,
       left: ExpressionTransformer,
@@ -342,6 +357,7 @@ trait SparkPlanExecApi {
 
   // For date_add(cast('2001-01-01' as Date), interval 1 day), backends may handle it in different
   // ways
+  // 处理日期相关的计算，这些在不同后端（如 Velox vs CH）中通常有完全不同的函数签名。
   def genDateAddTransformer(
       attributeSeq: Seq[Attribute],
       substraitExprName: String,
@@ -361,6 +377,7 @@ trait SparkPlanExecApi {
    * @return
    */
   // scalastyle:off argcount
+  // 生成 ShuffleDependency。这是 Spark 调度系统识别 Shuffle 的核心对象，Gluten 在这里注入了列式序列化器。
   def genShuffleDependency(
       rdd: RDD[ColumnarBatch],
       childOutputAttributes: Seq[Attribute],
@@ -383,9 +400,10 @@ trait SparkPlanExecApi {
    *
    * @return
    */
+  // 创建 Native 侧优化的 Shuffle 写入器（支持压缩、分区等）和读取器。
   def genColumnarShuffleWriter[K, V](
       parameters: GenShuffleWriterParameters[K, V]): GlutenShuffleWriterWrapper[K, V]
-
+  // 创建 Native 侧优化的 Shuffle 写入器（支持压缩、分区等）和读取器。
   def genColumnarShuffleReader[K, C](
       parameters: GenShuffleReaderParameters[K, C]): GlutenShuffleReaderWrapper[K, C]
 
@@ -394,6 +412,7 @@ trait SparkPlanExecApi {
    *
    * @return
    */
+  // 创建用于传输 ColumnarBatch 的专用序列化器。
   def createColumnarBatchSerializer(
       schema: StructType,
       metrics: Map[String, SQLMetric],
@@ -411,6 +430,7 @@ trait SparkPlanExecApi {
   }
 
   /** Create ColumnarWriteFilesExec */
+  // 创建列式写文件算子，用于 Native 存储写入。
   def createColumnarWriteFilesExec(
       child: WriteFilesExecTransformer,
       noop: SparkPlan,
@@ -421,6 +441,7 @@ trait SparkPlanExecApi {
       staticPartitions: TablePartitionSpec): ColumnarWriteFilesExec
 
   /** Create ColumnarArrowEvalPythonExec, for velox backend */
+  // 为支持 Python UDF 的后端（如 Velox）创建基于 Arrow 的 Python 执行算子。
   def createColumnarArrowEvalPythonExec(
       udfs: Seq[PythonUDF],
       resultAttrs: Seq[Attribute],
@@ -479,7 +500,7 @@ trait SparkPlanExecApi {
       timeExp: ExpressionTransformer,
       format: ExpressionTransformer,
       original: Expression): ExpressionTransformer
-
+  // 处理日期相关的计算，这些在不同后端（如 Velox vs CH）中通常有完全不同的函数签名。
   def genDateDiffTransformer(
       substraitExprName: String,
       endDate: ExpressionTransformer,
@@ -496,9 +517,11 @@ trait SparkPlanExecApi {
   }
 
   /** Define backend-specific expression mappings. */
+  // 允许后端定义自己特有的表达式映射（例如某个后端支持特定的自定义函数）。
   def extraExpressionMappings: Seq[Sig] = Seq.empty
 
   /** Define backend-specific expression converter. */
+  // 允许后端定义自己特有的表达式映射（例如某个后端支持特定的自定义函数）。
   def extraExpressionConverter(
       substraitExprName: String,
       expr: Expression,
@@ -509,6 +532,7 @@ trait SparkPlanExecApi {
    * Define whether the join operator is fallback because of the join operator is not supported by
    * backend
    */
+  // 一个布尔检查，用于判断某种 Join 类型或条件是否不被后端支持，从而决定是否回退（Fallback）到 Spark 原生执行。
   def joinFallback(
       JoinType: JoinType,
       leftOutputSet: AttributeSet,
@@ -516,6 +540,7 @@ trait SparkPlanExecApi {
       condition: Option[Expression]): Boolean = false
 
   /** default function to generate window function node */
+  // 这是代码中最长的一个默认实现方法。它解析 Spark 的 WindowExpression（如 RowNumber, Rank, Lead, Lag 等），并根据窗口帧（Frame）定义，手动构造 Substrait 协议中的窗口函数节点。
   def genWindowFunctionsNode(
       windowExpression: Seq[NamedExpression],
       windowExpressionNodes: JList[WindowFunctionNode],
@@ -654,6 +679,7 @@ trait SparkPlanExecApi {
   def supportPushDownFilterToScan(sparkExecNode: LeafExecNode): Boolean = true
 
   /** Return whether the filter is supported in scan. */
+ // 校验某个过滤条件是否能被下推到文件扫描层（Scan）
   def isSupportedScanFilter(filter: Expression, sparkExecNode: LeafExecNode): Boolean = {
     ExpressionConverter.canReplaceWithExpressionTransformer(
       ExpressionConverter.replaceAttributeReference(filter),
@@ -678,7 +704,7 @@ trait SparkPlanExecApi {
     arrowEvalPythonExec
 
   def maybeCollapseTakeOrderedAndProject(plan: SparkPlan): SparkPlan = plan
-
+  // 精确计算 Decimal 类型在 Round 运算后的精度（Precision）和标度（Scale），防止溢出。
   def genDecimalRoundExpressionOutput(decimalType: DecimalType, toScale: Int): DecimalType = {
     val p = decimalType.precision
     val s = decimalType.scale
@@ -725,7 +751,7 @@ trait SparkPlanExecApi {
       limit: Int,
       plan: SparkPlan,
       offset: Int): ColumnarCollectLimitBaseExec
-
+  // 转换 Range 算子（生成数字序列）。
   def genColumnarRangeExec(rangeExec: RangeExec): ColumnarRangeBaseExec
 
   def genColumnarTailExec(limit: Int, plan: SparkPlan): ColumnarCollectTailBaseExec

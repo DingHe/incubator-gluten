@@ -33,9 +33,16 @@ import org.apache.spark.sql.types.{StructField, StructType}
 
 import org.apache.hadoop.conf.Configuration
 
+// BackendSettingsApi 是 Apache Gluten 架构中用于定义后端能力边界与静态配置的接口。
+// 如果说 ValidatorApi 是在运行时进行“动态体检”，那么 BackendSettingsApi 就是后端的“规格说明书”。它告知 Gluten 核心框架：当前的后端（如 Velox 或 ClickHouse）原生支持哪些算子、在处理特定 SQL 场景时需要哪些特殊转换、以及数据交换的默认标准。
+// 能力声明（Capability Declaration）：明确指出后端是否支持特定的 Spark 物理算子（如 SortExec, WindowExec）。
+// 转换策略指导：指导 Gluten 核心引擎在生成 Substrait 计划时，是否需要进行额外的重写（如 Join Key 重写、Decimal 精度缩放）。
+// 适配器参数：提供后端特有的元数据处理方式（如大小写敏感度、文件格式映射）。
+// 兼容性开关：针对不同版本的 Spark 或特定的存储格式（如 Iceberg），开关相应的优化特性。
 trait BackendSettingsApi {
 
   /** The default columnar-batch type of this backend. */
+  // 定义后端默认的列式数据内存布局类型（例如 Velox 使用其特有的 Vector 格式）。
   def primaryBatchType: Convention.BatchType
 
   def validateScanExec(
@@ -47,7 +54,7 @@ trait BackendSettingsApi {
       hadoopConf: Configuration,
       partitionFileFormats: Set[ReadFileFormat]): ValidationResult =
     ValidationResult.succeeded
-
+  // 将 Spark 的 FileFormat 或 Scan 对象转换为 Substrait 标准的 ReadFileFormat 枚举。
   def getSubstraitReadFileFormatV1(fileFormat: FileFormat): LocalFilesNode.ReadFileFormat
 
   def getSubstraitReadFileFormatV2(scan: Scan): LocalFilesNode.ReadFileFormat
@@ -64,7 +71,7 @@ trait BackendSettingsApi {
   def supportNativeMetadataColumns(): Boolean = true
 
   def supportNativeRowIndexColumn(): Boolean = true
-
+  // 是否支持 Expand（用于 Rollup/Cube）和 Sort 算子。
   def supportExpandExec(): Boolean = false
 
   def supportSortExec(): Boolean = false
@@ -96,9 +103,9 @@ trait BackendSettingsApi {
     case leftSingle if SparkShimLoader.getSparkShims.isLeftSingleJoinType(leftSingle) => true
     case _ => false
   }
-
+  // 后端是否支持 Struct 复杂数据类型。
   def supportStructType(): Boolean = false
-
+  // 处理 Struct 字段时是否需要转换为小写。
   def structFieldToLowerCase(): Boolean = true
 
   // Whether to fallback aggregate at the same time if its empty-output child is fallen back.
