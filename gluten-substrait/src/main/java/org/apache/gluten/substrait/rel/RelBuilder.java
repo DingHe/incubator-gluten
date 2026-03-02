@@ -35,9 +35,19 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 /** Contains helper functions for constructing substrait relations. */
+// 在 Apache Gluten 项目中，RelBuilder 是一个核心静态工厂类。
+// 它被设计为构建 Substrait 关系算子（Relations）的“总机”，为所有 Spark 物理算子到 Substrait 算子的转换提供统一的入口。
+// RelBuilder 的核心作用是标准化和简化 Substrait 算子节点的创建过程。
+// 在将 Spark 物理计划转换为 Substrait 计划时，每个算子的构建都涉及多个步骤（如注册算子 ID、处理扩展节点、处理验证逻辑等）。RelBuilder 将这些重复逻辑封装起来：
+// 解耦算子实例化：屏蔽了各种 RelNode 实现类（如 FilterRelNode, JoinRelNode）的构造细节。
+// 自动状态管理：在创建算子的同时，自动调用 SubstraitContext 注册算子与 Rel 的对应关系。
+// 支持多后端验证：通过 createExtensionNode 将 Spark 的类型信息嵌入到 Substrait 计划中，供 Native 端进行模式校验。
 public class RelBuilder {
   private RelBuilder() {}
 
+  // 将 Spark 的属性（Attribute）转换为 Substrait 的扩展节点。
+  // 遍历 Spark 的属性列表，提取数据类型和可空性并转为 TypeNode，最后打包成一个 AdvancedExtensionNode。
+  // 这主要用于 Native 端（如 Velox）在接收到计划时，验证输入数据的结构是否符合预期。
   public static AdvancedExtensionNode createExtensionNode(List<Attribute> inputAttributes) {
     // Use an extension node to send the input types through Substrait plan for validation.
     List<TypeNode> inputTypeNodeList =
