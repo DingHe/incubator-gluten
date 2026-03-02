@@ -38,9 +38,15 @@ import scala.collection.mutable.ArrayBuffer
 trait Transformable {
   def getTransformer(childrenTransformers: Seq[ExpressionTransformer]): ExpressionTransformer
 }
-
+// 在 Apache Gluten 项目中，ExpressionConverter 是一个核心逻辑枢纽。如果说 ExpressionTransformer 是具体的“翻译员”，那么 ExpressionConverter 就是**“翻译调度中心”**。
+// 其核心作用是将 Spark 的 Catalyst 表达式树 转换为 Gluten 的 ExpressionTransformer 树。
+// 它是 Gluten 算子下推（Offloading）逻辑的第一步。在 Spark 物理算子被转换为 Substrait 算子之前，其内部携带的所有表达式（如 Filter 中的条件、Project 中的列）都必须通过这个类进行扫描和转换。
+// 分发路由：根据表达式类型（加减乘除、UDF、CaseWhen 等）决定使用哪个 Transformer。
+// 兼容性检查：判断一个表达式是否能被 Native 引擎支持。
+// 后端适配：通过 BackendsApiManager 调用不同后端（Velox, ClickHouse 等）特有的转换逻辑。
 object ExpressionConverter extends SQLConfHelper with Logging {
-
+  // 对外暴露的主入口。
+  // 接收 Spark 表达式和属性序列（用于绑定引用），调用内部私有方法 replaceWithExpressionTransformer0 开始递归转换过程。
   def replaceWithExpressionTransformer(
       exprs: Seq[Expression],
       attributeSeq: Seq[Attribute]): Seq[ExpressionTransformer] = {
