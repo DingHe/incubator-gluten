@@ -25,14 +25,21 @@
 using namespace facebook::velox;
 
 namespace {
+// 涉及了 Velox 引擎中**向量化数据布局（Vector Layout）**的核心概念。
+//makeArrayVector 的主要作用是：将一个扁平的向量（Flat Vector）包装成一个包含单个数组元素的数组向量（Array Vector）。
+// 简单来说，如果你有一组数据 [1, 2, 3]，这个方法会把它变成 [[1, 2, 3]]。
 ArrayVectorPtr makeArrayVector(const VectorPtr& elements) {
   BufferPtr offsets = allocateOffsets(1, elements->pool());
   BufferPtr sizes = allocateOffsets(1, elements->pool());
   sizes->asMutable<vector_size_t>()[0] = elements->size();
 
-  return std::make_shared<ArrayVector>(elements->pool(), ARRAY(elements->type()), nullptr, 1, offsets, sizes, elements);
+  return std::make_shared<ArrayVector>(elements->pool(), // // 1. 使用与元素相同的内存池
+  ARRAY(elements->type()), // // 2. 构造数组类型（如 ARRAY(B
+  nullptr, 1, offsets, sizes, elements);
 }
-
+// 将一个键向量（Key Vector）和一个值向量（Value Vector）包装成一个仅包含单行数据的 MapVector。
+// keyVector: 存储所有键（Keys）的向量。
+// valueVector: 存储所有对应值（Values）的向量。
 MapVectorPtr makeMapVector(const VectorPtr& keyVector, const VectorPtr& valueVector) {
   BufferPtr offsets = allocateOffsets(1, keyVector->pool());
   BufferPtr sizes = allocateOffsets(1, keyVector->pool());
@@ -49,6 +56,8 @@ MapVectorPtr makeMapVector(const VectorPtr& keyVector, const VectorPtr& valueVec
       valueVector);
 }
 
+// 用于构建 Velox 中的 RowVector（行向量）。在 Velox 引擎中，RowVector 是最重要的数据结构之一，因为它代表了 SQL 中的一行行记录（即 Row 或 Struct），通常作为算子之间传递的 数据批次（Batch）
+// 将一组列向量（Columns）组合成一个具有指定列名和类型的结构化数据集。
 RowVectorPtr makeRowVector(
     const std::vector<VectorPtr>& children,
     std::vector<std::string>&& names,
@@ -79,24 +88,37 @@ RowVectorPtr makeEmptyRowVector(memory::MemoryPool* pool) {
   return makeRowVector({}, {}, 0, pool);
 }
 
+// 专门用于将 Substrait 的 Literal（字面量/常量） 值填充到 Velox 的 FlatVector（扁平向量） 中的指定位置。
+// template <typename T>: 这是一个泛型函数。T 对应 C++ 的原生类型（如 int64_t, double, bool, std::string_view 等）。
 template <typename T>
 void setLiteralValue(const ::substrait::Expression::Literal& literal, FlatVector<T>* vector, vector_size_t index) {
   if (literal.has_null()) {
     vector->setNull(index, true);
   } else {
+    // 调用解析器工具类，根据模板类型 T，从 Substrait 的 Protobuf 对象中提取出对应的 C++ 类型值。
     vector->set(index, gluten::SubstraitParser::getLiteralValue<T>(literal));
   }
 }
 
+// 根据给定的类型（TypeKind）和大小，通过一个回调函数逐个提取 Substrait 字面量并填充，最终生成一个 Velox 的 FlatVector（扁平向量）。
+// 它是连接“数据产生源（Substrait Literal 列表）”与“Velox 内存存储（FlatVector）”的桥梁。
 template <TypeKind kind>
 VectorPtr constructFlatVector(
+    // elementAt: 一个回调函数（Lambda）。
+    // 它接受一个索引 idx，并返回对应的 Substrait 字面量对象。这种设计非常灵活，数据源可以是数组、Protobuf 列表或其他结构。
     std::function<::substrait::Expression::Literal(vector_size_t /* idx */)> elementAt,
+    // size: 向量的总行数。
     const vector_size_t size,
+    // type: Velox 的类型对象，描述了该向量存储的数据类型。
     const TypePtr& type,
     memory::MemoryPool* pool) {
+  // FlatVector 只支持基础原始类型（如整型、浮点型、布尔型、字符串等），不支持 Map 或 Array 等复杂类型。
   VELOX_CHECK(type->isPrimitiveType());
+  // 根据传入的 type 和 size，在内存池中分配一块连续的内存空间。此时返回的是基类指针 VectorPtr。
   auto vector = BaseVector::create(type, size, pool);
+  // 这是 Velox 的类型元编程工具。它将 TypeKind（如 BIGINT）映射为 C++ 的原生类型 T（如 int64_t）
   using T = typename TypeTraits<kind>::NativeType;
+  // 将通用的 BaseVector 强制转换为具体的 FlatVector<T>，以便后续调用 set 方法写入数据
   auto flatVector = vector->as<FlatVector<T>>();
 
   for (int i = 0; i < size; i++) {
@@ -106,6 +128,7 @@ VectorPtr constructFlatVector(
   return vector;
 }
 
+// 根据 Substrait 定义的常量（Literal）的具体类型，映射并返回 Velox 引擎中对应的标量数据类型（TypePtr）。
 TypePtr getScalarType(const ::substrait::Expression::Literal& literal) {
   auto typeCase = literal.literal_type_case();
   switch (typeCase) {
@@ -147,6 +170,8 @@ TypePtr getScalarType(const ::substrait::Expression::Literal& literal) {
 }
 
 /// Whether is try cast.
+// 用于判断 Substrait 的 CAST 表达式在转换失败时是否应该采取 “尝试转换”（Try Cast） 模式。
+// 在 SQL 中，普通的 CAST 在转换失败时（例如将 "abc" 转为数字）会报错，而 TRY_CAST 则会返回 NULL 而不中断查询。
 bool isTryCast(::substrait::Expression::Cast::FailureBehavior failureBehavior) {
   switch (failureBehavior) {
     case ::substrait::Expression_Cast_FailureBehavior_FAILURE_BEHAVIOR_UNSPECIFIED:
@@ -158,7 +183,8 @@ bool isTryCast(::substrait::Expression::Cast::FailureBehavior failureBehavior) {
       VELOX_NYI("The given failure behavior is NOT supported: '{}'", std::to_string(failureBehavior));
   }
 }
-
+// 用于在构建 Struct（结构体） 常量时，为其中的成员字段创建 FlatVector。
+// 它与普通的 constructFlatVector 非常相似，但有一个关键区别：它专门处理 单行（index 0） 的数据填充，这通常发生在将 Substrait 的嵌套字面量映射到 Velox 的 RowVector 成员过程中。
 template <TypeKind kind>
 VectorPtr constructFlatVectorForStruct(
     const ::substrait::Expression::Literal& child,
@@ -173,6 +199,8 @@ VectorPtr constructFlatVectorForStruct(
   return vector;
 }
 
+// 核心作用是：将 Substrait 的字面量（Literal）转换为 Velox 的常量表达式（ConstantTypedExpr）
+// 这个函数创建的是一个逻辑表达式节点，它告诉 Velox 执行引擎：“此处是一个固定不变的值”。
 template <TypeKind kind>
 std::shared_ptr<core::ConstantTypedExpr> constructConstantVector(
     const ::substrait::Expression::Literal& substraitLit,
@@ -188,6 +216,8 @@ std::shared_ptr<core::ConstantTypedExpr> constructConstantVector(
       type, variant(gluten::SubstraitParser::getLiteralValue<T>(substraitLit)));
 }
 
+// 用于构建 Velox 的 FieldAccessTypedExpr（字段访问表达式）。
+// 在 SQL 执行计划中，这个表达式的作用类似于“抓取”动作：它告诉引擎从输入数据（如表的一列或上一个函数的输出结构）中提取特定的字段。
 core::FieldAccessTypedExprPtr
 makeFieldAccessExpr(const std::string& name, const TypePtr& type, core::FieldAccessTypedExprPtr input) {
   if (input) {
@@ -203,11 +233,14 @@ using facebook::velox::variantToVector;
 
 namespace gluten {
 
+// 将 Substrait 的字段引用（基于索引的路径）转换为 Velox 的字段访问表达式（基于名称和类型的树状结构）
+// 在分布式 SQL 引擎中，Substrait 通常使用“列索引路径”（如：第 0 列下的第 1 个子字段）来引用数据，而 Velox 需要明确的“列名和类型”来定位内存向量。该方法完成了这两者之间的映射。
 std::shared_ptr<const core::FieldAccessTypedExpr> SubstraitVeloxExprConverter::toVeloxExpr(
     const ::substrait::Expression::FieldReference& substraitField,
     const RowTypePtr& inputType) {
   auto typeCase = substraitField.reference_type_case();
   switch (typeCase) {
+    // 判断引用的类型。Substrait 支持多种引用方式，这里主要处理 DirectReference（直接引用），即通过明确的索引路径访问数据。
     case ::substrait::Expression::FieldReference::ReferenceTypeCase::kDirectReference: {
       const auto& directRef = substraitField.direct_reference();
       core::FieldAccessTypedExprPtr fieldAccess{nullptr};
@@ -231,8 +264,11 @@ std::shared_ptr<const core::FieldAccessTypedExpr> SubstraitVeloxExprConverter::t
       VELOX_NYI("Substrait conversion not supported for Reference '{}'", std::to_string(typeCase));
   }
 }
-
+// 专门用于处理 日期时间提取（Extract） 逻辑的方法
+// 将 Substrait 协议中统一的 EXTRACT 函数调用，映射为 Velox 引擎中具体的日期处理标量函数（如 year(), month(), day() 等）
+// 在 SQL 中，EXTRACT(YEAR FROM col) 这种语法在 Substrait 中通常表现为一个带有两个参数的函数：第一个参数是目标字段（YEAR），第二个参数是源数据（col）。
 core::TypedExprPtr SubstraitVeloxExprConverter::toExtractExpr(
+     // // 已经转换好的 Velox 参数列表
     const std::vector<core::TypedExprPtr>& params,
     const TypePtr& outputType) {
   VELOX_CHECK_EQ(params.size(), 2);
@@ -244,12 +280,15 @@ core::TypedExprPtr SubstraitVeloxExprConverter::toExtractExpr(
       VELOX_FAIL("Value expected in variant.");
     }
     // The first parameter specifies extracting from which field.
+    // 获取这个常量的字符串值。例如，如果 SQL 是 EXTRACT(YEAR FROM ...)，那么 from 的值就是 "YEAR"。
     std::string from = variant.value<std::string>();
 
     // The second parameter is the function parameter.
+    // Velox 并不使用 extract(unit, date) 这种形式，而是直接使用 unit(date)。因此，新的参数列表中只需要保留原始的日期/时间列（即 params[1]）。
     std::vector<core::TypedExprPtr> exprParams;
     exprParams.reserve(1);
     exprParams.emplace_back(params[1]);
+    // 函数名映射与转换
     auto iter = extractDatetimeFunctionMap_.find(from);
     if (iter != extractDatetimeFunctionMap_.end()) {
       return std::make_shared<const core::CallTypedExpr>(outputType, std::move(exprParams), iter->second);
@@ -259,14 +298,21 @@ core::TypedExprPtr SubstraitVeloxExprConverter::toExtractExpr(
   }
   VELOX_FAIL("Constant is expected to be the first parameter in extract.");
 }
-
+// 用于处理 Lambda 表达式（匿名函数）转换的方法。
+// 在 SQL 中，Lambda 表达式常用于高阶函数，例如 transform(array, x -> x + 1) 或 filter(array, x -> x > 0)。
+// 在 Substrait 协议中，Lambda 的结构比较特殊，它通常被包装在一个标量函数中，其中包含了 Lambda 的定义（逻辑主体）以及它所使用的参数名和类型。
+// 该方法的作用是将 Substrait 形式的 Lambda 定义转换为 Velox 的 core::LambdaTypedExpr。
+// 输入：一个 ScalarFunction（代表 Lambda 容器）和当前上下文的输入类型。
+// 逻辑：Substrait 中的 Lambda 函数至少包含两个部分：第一个参数（Index 0）是 Lambda 的主体逻辑，后续参数（Index 1 及以后）是 Lambda 的参数定义。
 core::TypedExprPtr SubstraitVeloxExprConverter::toLambdaExpr(
     const ::substrait::Expression::ScalarFunction& substraitFunc,
     const RowTypePtr& inputType) {
   // Arguments names and types.
+  // 存储 Lambda 参数的名字
   std::vector<std::string> argumentNames;
   VELOX_CHECK_GT(substraitFunc.arguments().size(), 1, "lambda should have at least 2 args.");
   argumentNames.reserve(substraitFunc.arguments().size() - 1);
+  // 参数类型
   std::vector<TypePtr> argumentTypes;
   argumentTypes.reserve(substraitFunc.arguments().size() - 1);
   for (int i = 1; i < substraitFunc.arguments().size(); i++) {
@@ -278,13 +324,17 @@ core::TypedExprPtr SubstraitVeloxExprConverter::toLambdaExpr(
     argumentNames.emplace_back(arg.scalar_function().arguments(0).value().literal().string());
     argumentTypes.emplace_back(SubstraitParser::parseType(arg.scalar_function().output_type()));
   }
+  // 在 Velox 中，Lambda 的参数列表被定义为一个 RowType（类似于一个结构体）。这定义了 Lambda 内部可见的局部变量作用域
   auto rowType = ROW(std::move(argumentNames), std::move(argumentTypes));
   // Arg[0] -> function.
   auto lambda =
       std::make_shared<core::LambdaTypedExpr>(rowType, toVeloxExpr(substraitFunc.arguments(0).value(), inputType));
   return lambda;
 }
-
+// 作用是：将 Substrait 的标量函数（ScalarFunction）映射并转换为 Velox 的表达式（TypedExpr）。
+// 输入：substraitFunc（Substrait 定义的函数调用，包含函数 ID、参数列表和输出类型）以及 inputType（输入数据的 Schema）。
+// 输出：转换后的 Velox 表达式节点（通常是一个 CallTypedExpr）。
+// 逻辑：深度优先遍历。如果参数是另一个函数（如 add(a, multiply(b, c))），会递归调用 toVeloxExpr，确保参数列表 params 中存储的是已经转换好的 Velox 表达式树。
 core::TypedExprPtr SubstraitVeloxExprConverter::toVeloxExpr(
     const ::substrait::Expression::ScalarFunction& substraitFunc,
     const RowTypePtr& inputType) {
@@ -293,7 +343,9 @@ core::TypedExprPtr SubstraitVeloxExprConverter::toVeloxExpr(
   for (const auto& sArg : substraitFunc.arguments()) {
     params.emplace_back(toVeloxExpr(sArg.value(), inputType));
   }
+  // 通过 function_reference（一个整数 ID）在 functionMap_ 中查找对应的 Velox 函数字符串名（如 "add", "lte"）
   const auto& veloxFunction = SubstraitParser::findVeloxFunction(functionMap_, substraitFunc.function_reference());
+  // 将 Substrait 序列化的输出类型转换为 Velox 的 TypePtr
   const auto& outputType = SubstraitParser::parseType(substraitFunc.output_type());
 
   if (veloxFunction == "lambdafunction") {
@@ -307,14 +359,18 @@ core::TypedExprPtr SubstraitVeloxExprConverter::toVeloxExpr(
   }
   return std::make_shared<const core::CallTypedExpr>(outputType, std::move(params), veloxFunction);
 }
-
+// 将一组 Substrait 字面量（Literal）转换为一个包含数组（Array）的 Velox 常量表达式（ConstantTypedExpr）。
+// 用于处理 SQL 中的常量数组，例如 IN (1, 2, 3) 语句中的列表，或者直接定义的数组常量。
+// 输入：literals，一个 Substrait 字面量列表（例如 [1, 2, 3]）。
 std::shared_ptr<const core::ConstantTypedExpr> SubstraitVeloxExprConverter::literalsToConstantExpr(
     const std::vector<::substrait::Expression::Literal>& literals) {
+  // 转换字面量为 Variant 集合
   std::vector<variant> variants;
   variants.reserve(literals.size());
   VELOX_CHECK_GE(literals.size(), 0, "List should have at least one item.");
   std::optional<TypePtr> literalType;
   for (const auto& literal : literals) {
+    // // 递归调用，处理单个字面量
     auto veloxVariant = toVeloxExpr(literal);
     if (!literalType.has_value()) {
       literalType = veloxVariant->type();
@@ -322,13 +378,18 @@ std::shared_ptr<const core::ConstantTypedExpr> SubstraitVeloxExprConverter::lite
     variants.emplace_back(veloxVariant->value());
   }
   VELOX_CHECK(literalType.has_value(), "Type expected.");
+  // 将 std::vector<variant> 包装成一个单一的数组类型的 variant。这在逻辑上形成了一个“数组对象”。
   auto varArray = Variant::array(variants);
   VectorPtr arrayVector = variantToVector(ARRAY(literalType.value()), varArray, pool_);
   // Wrap the array vector into constant vector.
   auto constantVector = BaseVector::wrapInConstant(1 /*length*/, 0 /*index*/, arrayVector);
   return std::make_shared<const core::ConstantTypedExpr>(constantVector);
 }
-
+// 专门用于处理 SQL IN 谓词（Substrait 中称为 SingularOrList）的方法。
+// 它的核心作用是：将 Substrait 的“值与列表匹配”逻辑转换为 Velox 的 in 函数调用。
+// 在 SQL 中，column IN (1, 2, 3) 这种语法在 Substrait 协议中表现为 SingularOrList。该方法会将这种结构拆解并重新包装成：
+// 被检查的值（如 column）。
+// 备选列表（如 (1, 2, 3)），并将其处理为 Velox 的常量数组表达式。
 core::TypedExprPtr SubstraitVeloxExprConverter::toVeloxExpr(
     const ::substrait::Expression::SingularOrList& singularOrList,
     const RowTypePtr& inputType) {
@@ -348,12 +409,14 @@ core::TypedExprPtr SubstraitVeloxExprConverter::toVeloxExpr(
   params.emplace_back(literalsToConstantExpr(literals));
   return std::make_shared<const core::CallTypedExpr>(BOOLEAN(), std::move(params), "in");
 }
-
+// 主要职责是将 Substrait 协议中定义的各种常量值（包括简单标量、嵌套集合、空值等）全面转化为 Velox 执行计划所需的 ConstantTypedExpr（常量表达式）。
 std::shared_ptr<const core::ConstantTypedExpr> SubstraitVeloxExprConverter::toVeloxExpr(
     const ::substrait::Expression::Literal& substraitLit) {
   auto typeCase = substraitLit.literal_type_case();
   switch (typeCase) {
     case ::substrait::Expression_Literal::LiteralTypeCase::kList: {
+      // 将 Substrait 列表转换为 Velox 的 ArrayVector
+      // 创建一个常量包装器。由于字面量代表一个确定的值，所以长度为 1，索引指向第 0 行。
       auto constantVector = BaseVector::wrapInConstant(1, 0, literalsToArrayVector(substraitLit));
       return std::make_shared<const core::ConstantTypedExpr>(constantVector);
     }

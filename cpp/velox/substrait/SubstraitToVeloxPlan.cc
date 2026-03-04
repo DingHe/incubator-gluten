@@ -43,6 +43,8 @@ using namespace cudf_velox::connector::hive;
 namespace gluten {
 namespace {
 
+// 用于判断当前的执行上下文是否应该使用 cuDF (NVIDIA GPU 加速库) 的表句柄（Table Handle）来处理数据
+// 它在 Apache Gluten 项目中负责协调 CPU (Velox) 和 GPU (Gaze/cuDF) 之间的执行路径切换。
 bool useCudfTableHandle(const std::vector<std::shared_ptr<SplitInfo>>& splitInfos) {
 #ifdef GLUTEN_ENABLE_GPU
   if (splitInfos.empty()) {
@@ -53,11 +55,19 @@ bool useCudfTableHandle(const std::vector<std::shared_ptr<SplitInfo>>& splitInfo
   return false;
 #endif
 }
-
+// 将 Substrait 协议中定义的排序规则（Sort Direction）转换为 Velox 引擎内部使用的排序对象 core::SortOrder。
+// 在分布式 SQL 引擎中，排序不仅仅涉及升序（ASC）或降序（DESC），还必须明确规定 NULL 值应该排在最前面还是最后面，这对于保证分布式 Join 或 Window 算子的结果一致性至关重要。
+// 该函数通过 switch 语句对 Substrait 协议定义的枚举值进行硬映射。它处理了排序的两个维度：
+// 方向 (Direction)：升序 vs 降序。
+// 空值位置 (Null Placement)：空值在前 vs 空值在后。
+// 输入：sortField，代表 Substrait 中的一个排序字段配置。
+// 输出：Velox 的 core::SortOrder 常量。
 core::SortOrder toSortOrder(const ::substrait::SortField& sortField) {
   switch (sortField.direction()) {
+    // 升序，NULL 在前
     case ::substrait::SortField_SortDirection_SORT_DIRECTION_ASC_NULLS_FIRST:
       return core::kAscNullsFirst;
+    // 升序，NULL 在后
     case ::substrait::SortField_SortDirection_SORT_DIRECTION_ASC_NULLS_LAST:
       return core::kAscNullsLast;
     case ::substrait::SortField_SortDirection_SORT_DIRECTION_DESC_NULLS_FIRST:
@@ -73,22 +83,31 @@ core::SortOrder toSortOrder(const ::substrait::SortField& sortField) {
 /// a project node to simulate the emit
 /// behavior in Substrait.
 struct EmitInfo {
-  std::vector<core::TypedExprPtr> expressions;
-  std::vector<std::string> projectNames;
+  std::vector<core::TypedExprPtr> expressions; // // 存储字段访问表达式
+  std::vector<std::string> projectNames; // 存储输出列的名字
 };
 
 /// Helper function to extract the attributes required to create a ProjectNode
 /// used for interpreting Substrait Emit.
+// Substrait 协议中一个非常重要且灵活的特性：Emit（输出映射）
+// 在 Substrait 中，几乎任何关系算子（Rel）都可以包含一个 Emit 字段。
+// 它的作用是重排、过滤或选择该算子产生的原始输出列。Gluten 通过在当前算子之上人为添加一个 ProjectNode（投影节点） 来模拟这种行为。
 EmitInfo getEmitInfo(const ::substrait::RelCommon& relCommon, const core::PlanNodePtr& node) {
   const auto& emit = relCommon.emit();
+  // output_mapping: 这是 Substrait 中的一个整数列表。例如，如果 mapping 是 [2, 0]，意味着该算子最终只输出它的第 3 列和第 1 列。
   int emitSize = emit.output_mapping_size();
   EmitInfo emitInfo;
   emitInfo.projectNames.resize(emitSize);
   emitInfo.expressions.resize(emitSize);
+  // node: 这是当前的物理算子节点（如 FilterNode 或 AggregationNode）。
+  // outputType: 这是该算子在没有执行 Emit 之前产生的原始 Schema。我们需要这个“原始字典”来查找 mapping 索引对应的具体列信息。
   const auto& outputType = node->outputType();
   for (int i = 0; i < emitSize; i++) {
+    // // 获取 Substrait 指定的索引
     int32_t mapId = emit.output_mapping(i);
+    // // 获取该列的原始名称
     emitInfo.projectNames[i] = outputType->nameOf(mapId);
+    // // 创建一个指向原始列的字段访问表达式
     emitInfo.expressions[i] =
         std::make_shared<core::FieldAccessTypedExpr>(outputType->childAt(mapId), outputType->nameOf(mapId));
   }
@@ -99,6 +118,9 @@ EmitInfo getEmitInfo(const ::substrait::RelCommon& relCommon, const core::PlanNo
 /// @param leftNode the plan node of left side.
 /// @param rightNode the plan node of right side.
 /// @return the input type.
+// 用于合并 Join（连接）操作左右两路输入节点的 Schema。
+// 在执行 Join 转换时，系统需要知道合并后的“宽表”长什么样，以便后续解析 Join 条件（例如 ON left.col1 = right.col2）时，能够正确定位字段的索引。
+// 该函数执行的是一种 Schema 拼接（Concatenation） 操作：
 RowTypePtr getJoinInputType(const core::PlanNodePtr& leftNode, const core::PlanNodePtr& rightNode) {
   auto outputSize = leftNode->outputType()->size() + rightNode->outputType()->size();
   std::vector<std::string> outputNames;
@@ -111,6 +133,7 @@ RowTypePtr getJoinInputType(const core::PlanNodePtr& leftNode, const core::PlanN
     const auto& types = node->outputType()->children();
     outputTypes.insert(outputTypes.end(), types.begin(), types.end());
   }
+  // 利用拼接好的名称数组和类型数组，构造一个新的 RowType 对象（即 Velox 中的结构化行类型）
   return std::make_shared<const RowType>(std::move(outputNames), std::move(outputTypes));
 }
 
@@ -119,6 +142,9 @@ RowTypePtr getJoinInputType(const core::PlanNodePtr& leftNode, const core::PlanN
 /// @param rightNode the plan node of right side.
 /// @param joinType the join type.
 /// @return the output type.
+// 用于根据 Join 类型 确定 Join 算子在 Velox 中的 最终输出 Schema（RowType）。
+// 与之前合并左右两路输入的 getJoinInputType 不同，此函数考虑了 SQL 语义中不同 Join 对结果列的裁剪规则（例如：Semi Join 只保留一侧列）。
+// 函数通过判断 Join 类型 将输出 Schema 的构建分为四种主要场景：
 RowTypePtr getJoinOutputType(
     const core::PlanNodePtr& leftNode,
     const core::PlanNodePtr& rightNode,
@@ -132,11 +158,14 @@ RowTypePtr getJoinOutputType(
   bool outputMayIncludeRightColumns =
       !(core::isLeftSemiFilterJoin(joinType) || core::isLeftSemiProjectJoin(joinType) || core::isAntiJoin(joinType));
 
+  // 场景 A：全量输出（Inner, Left, Right, Full Outer Join）
+  // 逻辑：如果左右两边的列都允许出现在结果中，则调用 getJoinInputType 将左右 Schema 简单拼接。
   if (outputMayIncludeLeftColumns && outputMayIncludeRightColumns) {
     return getJoinInputType(leftNode, rightNode);
   }
-
+  // 场景 B：仅左侧输出（Left Semi/Anti Join）
   if (outputMayIncludeLeftColumns) {
+    // // 逻辑：左侧原始列 + 一个布尔类型的 "exists" 列
     if (core::isLeftSemiProjectJoin(joinType)) {
       std::vector<std::string> outputNames = leftNode->outputType()->names();
       std::vector<TypePtr> outputTypes = leftNode->outputType()->children();
@@ -144,6 +173,7 @@ RowTypePtr getJoinOutputType(
       outputTypes.emplace_back(BOOLEAN());
       return std::make_shared<const RowType>(std::move(outputNames), std::move(outputTypes));
     } else {
+      // 仅左侧列
       return leftNode->outputType();
     }
   }
@@ -165,6 +195,8 @@ RowTypePtr getJoinOutputType(
 // Get the function name suffix used by merge_extract companion function when having the same intermediate type across
 // signatures. Correponds to Velox 'toSuffixString', and the base name can be referred from
 // 'velox/expression/FunctionSignature.cpp'.
+// 核心作用是：为聚合函数的中间状态提取函数（Companion Function）生成一个唯一的类型后缀字符串。
+// 在 Velox 的聚合引擎中，当多个不同的函数签名共享同一种中间类型时，系统需要一种机制来区分它们。该函数通过递归地将数据类型（Type）转换为字符串，确保了函数签名的唯一性和可追溯性。
 std::string companionFunctionSuffix(const TypePtr& type) {
   // For primitive and decimal types, return their names.
   if (type->isDecimal()) {
@@ -200,9 +232,13 @@ std::string companionFunctionSuffix(const TypePtr& type) {
 
 } // namespace
 
+// 定义了 SplitInfo 对象的 canUseCudfConnector 逻辑，用于判断当前的数据分片（Split）是否可以交给 NVIDIA GPU 加速的 cuDF 读取器 来处理。
+// 其核心判断标准有两个：分区列（Partition Columns）的复杂程度 和 底层文件格式。
 bool SplitInfo::canUseCudfConnector() {
   bool isEmpty = partitionColumns.empty();
-
+  // 检查分区列是否为空
+  // 为什么这么做？：目前的 cuDF 连接器在处理带有复杂分区逻辑（例如 Hive 风格的动态分区路径）的扫描任务时，可能还存在限制或兼容性问题。
+  // 此逻辑倾向于将这种简单（非分区）的读取任务交给 GPU，以确保执行的稳定性。
   if (!isEmpty) {
     // Check if all maps are empty
     bool allMapsEmpty = true;
@@ -214,17 +250,24 @@ bool SplitInfo::canUseCudfConnector() {
     }
     isEmpty = allMapsEmpty;
   }
+  // 条件 1 (isEmpty)：如上所述，必须没有活跃的分区列。
+  // 条件 2 (format == PARQUET)：底层文件格式必须是 Parquet
   return isEmpty && format == dwio::common::FileFormat::PARQUET;
 }
-
+// 用于处理 Substrait 算子中的输出控制逻辑。
+// 它的作用是：根据 Substrait 协议定义的 Emit 规则，决定最终输出哪些列，以及是否需要在当前算子之上额外包裹一个投影节点（ProjectNode）。
+// 在 Substrait 协议中，每个关系（Rel）都可以通过 RelCommon 来定义其输出行为。该函数处理两种主要情况：
 core::PlanNodePtr SubstraitToVeloxPlanConverter::processEmit(
     const ::substrait::RelCommon& relCommon,
     const core::PlanNodePtr& noEmitNode) {
   switch (relCommon.emit_kind_case()) {
+    // 直接输出 (kDirect)
     case ::substrait::RelCommon::EmitKindCase::kDirect:
       return noEmitNode;
     case ::substrait::RelCommon::EmitKindCase::kEmit: {
+      // 根据 relCommon 中的映射索引，从 noEmitNode 的输出类型中提取字段名称和访问表达式。
       auto emitInfo = getEmitInfo(relCommon, noEmitNode);
+      // 构建 ProjectNode：创建一个新的投影节点作为父节点。
       return std::make_shared<core::ProjectNode>(
           nextPlanNodeId(), std::move(emitInfo.projectNames), std::move(emitInfo.expressions), noEmitNode);
     }
@@ -232,19 +275,26 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::processEmit(
       VELOX_FAIL("unrecognized emit kind");
   }
 }
-
+// 用于确定 Velox 聚合算子（AggregationNode）的执行阶段（Step）。
+// 在分布式查询引擎（如 Spark 或 Presto）中，聚合通常不是一次性完成的，而是分为多个阶段（如 Partial 局部聚合和 Final 最终聚合）。
 core::AggregationNode::Step SubstraitToVeloxPlanConverter::toAggregationStep(const ::substrait::AggregateRel& aggRel) {
   // TODO Simplify Velox's aggregation steps
+  // 高级扩展 (Advanced Extension)：Substrait 允许在算子中携带自定义元数据。Gluten 利用这一点传递特定的优化指令。
+  // allowFlush= 标志：这是一个关键的启发式信号。在 Spark 中，如果一个聚合操作允许“刷新”（Flush），通常意味着它是一个 Map-side 聚合。
+  // 返回值 kPartial：将 Velox 算子设置为“局部聚合”模式。在此模式下，Velox 不会产出最终结果，而是产出中间状态（Intermediate Accumulators），以便后续进行 Shuffle 和 Merge。
   if (aggRel.has_advanced_extension() &&
       SubstraitParser::configSetInOptimization(aggRel.advanced_extension(), "allowFlush=")) {
     return core::AggregationNode::Step::kPartial;
   }
+  // 意味着聚合将在单个节点上完成（从原始数据直接计算出最终结果），通常用于非分布式查询或已经洗牌（Shuffle）后的数据。
   return core::AggregationNode::Step::kSingle;
 }
 
 /// Get aggregation function step for AggregateFunction.
 /// The returned step value will be used to decide which Velox aggregate function or companion function
 /// is used for the actual data processing.
+// 用于定义 聚合函数（Aggregate Function）的具体执行步长（Step）。
+// 与之前处理算子级别的 toAggregationStep 不同，这个函数是函数级别的。它通过解析 Substrait 协议中的 phase（相位）字段，告诉 Velox 引擎当前函数是应该处理原始输入、合并中间状态，还是计算最终结果。
 core::AggregationNode::Step SubstraitToVeloxPlanConverter::toAggregationFunctionStep(
     const ::substrait::AggregateFunction& sAggFuc) {
   const auto& phase = sAggFuc.phase();
@@ -252,28 +302,41 @@ core::AggregationNode::Step SubstraitToVeloxPlanConverter::toAggregationFunction
     case ::substrait::AGGREGATION_PHASE_UNSPECIFIED:
       VELOX_FAIL("Aggregation phase not specified.");
       break;
+    // 从初始数据到中间状态
+    // 动作：读取原始行数据，产出聚合中间累加器（Accumulators）。
     case ::substrait::AGGREGATION_PHASE_INITIAL_TO_INTERMEDIATE:
       return core::AggregationNode::Step::kPartial;
+    // 从中间状态到中间状态
+    // 读取累加器并将其合并，输出更新后的累加器。这常见于多级 Shuffle 的复杂查询中。
     case ::substrait::AGGREGATION_PHASE_INTERMEDIATE_TO_INTERMEDIATE:
       return core::AggregationNode::Step::kIntermediate;
+    // 从初始数据到最终结果
+    // 在一个节点内完成所有计算，不输出中间状态，直接给结果。
     case ::substrait::AGGREGATION_PHASE_INITIAL_TO_RESULT:
       return core::AggregationNode::Step::kSingle;
+    // 从中间状态到最终结果
+    // 接收合并后的累加器，执行最后的计算（如 AVG 需要的除法操作），输出用户可见的结果。
     case ::substrait::AGGREGATION_PHASE_INTERMEDIATE_TO_RESULT:
       return core::AggregationNode::Step::kFinal;
     default:
       VELOX_FAIL("Unexpected aggregation phase.");
   }
 }
-
+// 用于根据聚合阶段（Step）动态构建 Velox 引擎所需的物理函数名称。
+// 在分布式计算中，同一个逻辑函数（如 avg）在不同阶段对应的底层 C++ 实现是完全不同的。该函数通过添加特定的后缀，确保 Velox 能调用正确的伴生函数（Companion Functions）
 std::string SubstraitToVeloxPlanConverter::toAggregationFunctionName(
     const std::string& baseName,
     const core::AggregationNode::Step& step,
     const TypePtr& resultType) {
   std::string suffix;
   switch (step) {
+    // 局部聚合
+    // 后缀为 _partial
     case core::AggregationNode::Step::kPartial:
       suffix = "_partial";
       break;
+    // 复杂阶段处理：kFinal (最终聚合)
+    // 当进入最终聚合阶段时，Velox 需要执行 merge_extract（合并并提取结果）。
     case core::AggregationNode::Step::kFinal: {
       auto functionName = baseName + "_merge_extract";
       auto signatures = exec::getAggregateFunctionSignatures(functionName);
@@ -290,9 +353,13 @@ std::string SubstraitToVeloxPlanConverter::toAggregationFunctionName(
           functionName);
       return functionName;
     }
+    // 中间合并
+    // 后缀为 _merge
     case core::AggregationNode::Step::kIntermediate:
       suffix = "_merge";
       break;
+    // 单步聚合
+    // 无后缀
     case core::AggregationNode::Step::kSingle:
       suffix = "";
       break;
@@ -301,7 +368,7 @@ std::string SubstraitToVeloxPlanConverter::toAggregationFunctionName(
   }
   return baseName + suffix;
 }
-
+// 负责将 Substrait 的 JoinRel（连接关系） 转换为 Velox 的物理计划节点。它涵盖了从连接类型映射、键提取到最终物理算法选择（Hash Join 或 Merge Join）的完整流程。
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::JoinRel& sJoin) {
   if (!sJoin.has_left()) {
     VELOX_FAIL("Left Rel is expected in JoinRel.");
@@ -309,11 +376,13 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   if (!sJoin.has_right()) {
     VELOX_FAIL("Right Rel is expected in JoinRel.");
   }
-
+  // A. 递归构建输入节点
+  // Join 是一个双目算子。代码首先递归转换左子树和右子树，生成 Velox 的 PlanNode。
   auto leftNode = toVeloxPlan(sJoin.left());
   auto rightNode = toVeloxPlan(sJoin.right());
 
   // Map join type.
+  // B. 连接类型映射 (Join Type Mapping)
   core::JoinType joinType;
   bool isNullAwareAntiJoin = false;
   switch (sJoin.type()) {
@@ -331,6 +400,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
       break;
     case ::substrait::JoinRel_JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_SEMI:
       // Determine the semi join type based on extracted information.
+      // Semi Join (Existence Join)：通过 advanced_extension 检查。如果在 Spark 中这是一个 ExistenceJoin（即不过滤行，而是增加一个布尔列），则映射为 kLeftSemiProject 或 kRightSemiProject。
       if (sJoin.has_advanced_extension() &&
           SubstraitParser::configSetInOptimization(sJoin.advanced_extension(), "isExistenceJoin=")) {
         joinType = core::JoinType::kLeftSemiProject;
@@ -349,6 +419,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
       break;
     case ::substrait::JoinRel_JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_ANTI: {
       // Determine the anti join type based on extracted information.
+      // Anti Join (Null-Aware)：检查是否为 isNullAwareAntiJoin。这对于 SQL 中的 NOT IN 语义至关重要，因为空值的处理逻辑在 Anti Join 中非常特殊。
       if (sJoin.has_advanced_extension() &&
           SubstraitParser::configSetInOptimization(sJoin.advanced_extension(), "isNullAwareAntiJoin=")) {
         isNullAwareAntiJoin = true;
@@ -361,6 +432,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   }
 
   // extract join keys from join expression
+  // C. 提取连接键 (Join Keys)
   std::vector<const ::substrait::Expression::FieldReference*> leftExprs, rightExprs;
   extractJoinKeys(sJoin.expression(), leftExprs, rightExprs);
   VELOX_CHECK_EQ(leftExprs.size(), rightExprs.size());
@@ -369,17 +441,19 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>> leftKeys, rightKeys;
   leftKeys.reserve(numKeys);
   rightKeys.reserve(numKeys);
+  // 从 Substrait 的 Join 表达式中分离出左表键和右表键。
+  // 随后使用 exprConverter_ 将这些字段引用转换为 Velox 的 FieldAccessTypedExpr。
   auto inputRowType = getJoinInputType(leftNode, rightNode);
   for (size_t i = 0; i < numKeys; ++i) {
     leftKeys.emplace_back(exprConverter_->toVeloxExpr(*leftExprs[i], inputRowType));
     rightKeys.emplace_back(exprConverter_->toVeloxExpr(*rightExprs[i], inputRowType));
   }
-
+  // 处理不满足等值条件的复杂过滤逻辑（例如 ON a.id = b.id AND a.val > b.val 中的 a.val > b.val）。
   core::TypedExprPtr filter;
   if (sJoin.has_post_join_filter()) {
     filter = exprConverter_->toVeloxExpr(sJoin.post_join_filter(), inputRowType);
   }
-
+  // 代码最后根据 advanced_extension 中的标志位决定生成的物理算子：
   if (sJoin.has_advanced_extension() &&
       SubstraitParser::configSetInOptimization(sJoin.advanced_extension(), "isSMJ=")) {
     // Create MergeJoinNode node
@@ -1546,7 +1620,9 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(
 
   return std::make_shared<core::ValuesNode>(nextPlanNodeId(), std::move(vectors));
 }
-
+// 主入口分发函数。
+// 它在逻辑计划转换中扮演着“交通枢纽”的角色，负责将通用的 Substrait 关系节点（Rel）拆解并路由到具体的 Velox 算子转换逻辑中。
+// Substrait 使用 Protobuf 的 oneof 结构来定义各种算子（如 Filter, Project, Join 等）。该函数通过一系列 if-else 分支检查输入的 rel 到底携带了哪种具体的算子类型，然后调用对应的重载函数进行转换。
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::Rel& rel) {
   if (rel.has_aggregate()) {
     return toVeloxPlan(rel.aggregate());
