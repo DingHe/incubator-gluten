@@ -21,17 +21,23 @@
 namespace gluten {
 namespace {
 
+// 返回一个存储 Runtime::Factory（函数指针/对象）的注册表。
+// 这决定了系统如何根据后端名称（如 "velox"）创建对应的 Runtime 实例。
 Registry<Runtime::Factory>& runtimeFactories() {
   static Registry<Runtime::Factory> registry;
   return registry;
 }
+// 返回一个存储 Runtime::Releaser 的注册表。这决定了当任务结束时，如何安全地销毁对应的 Runtime 实例。
 Registry<Runtime::Releaser>& runtimeReleasers() {
   static Registry<Runtime::Releaser> registry;
   return registry;
 }
 
 } // namespace
-
+// 作用是将特定执行引擎（如 Velox 或 ClickHouse）的“创建工厂”和“销毁函数”正式挂载到全局注册表上。
+// kind: 后端的标识符字符串。例如 "velox" 代表 Velox 引擎，"ch" 代表 ClickHouse 引擎。
+// factory: 一个函数对象（通常是 std::function），定义了如何实例化一个具体的 Runtime 子类。
+// releaser: 一个函数对象，定义了如何安全地销毁该 Runtime 实例。
 void Runtime::registerFactory(const std::string& kind, Runtime::Factory factory, Runtime::Releaser releaser) {
   runtimeFactories().registerObj(kind, std::move(factory));
   runtimeReleasers().registerObj(kind, std::move(releaser));

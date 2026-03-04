@@ -34,7 +34,12 @@
 #endif
 
 namespace gluten {
-
+// 在 Apache Gluten 项目中，VeloxRuntime 类是基类 Runtime 的具体实现，专为 Velox 执行引擎定制。它充当了 Spark Task 执行期间在 Native 侧的“神经中枢”。
+// VeloxRuntime 的核心作用是将通用的 Substrait 计划转化为 Velox 可执行的物理计划，并提供执行所需的全部工具链。
+// 计划翻译官：它负责将抽象的 substrait::Plan 转换为 Velox 内部的 facebook::velox::core::PlanNode 树。
+// 任务上下文持有者：它管理特定于当前任务的 Velox 配置（ConfigBase）和内存资源。
+// 组件工厂：它实现了父类定义的工厂方法，用于创建 Velox 版本的迭代器、转换器、序列化器以及 Shuffle 读写器。
+// 增强功能入口：通过宏定义支持 Iceberg 写入等增强特性。
 class VeloxRuntime final : public Runtime {
  public:
   explicit VeloxRuntime(
@@ -124,10 +129,13 @@ class VeloxRuntime final : public Runtime {
       std::vector<facebook::velox::core::PlanNodeId>& streamIds);
 
  private:
+  // Velox 物理计划树。这是转换后的最终结果，Velox 算子将直接根据这棵树进行 Pipeline 调度。
   std::shared_ptr<const facebook::velox::core::PlanNode> veloxPlan_;
+  // 任务级配置。存储了当前会话的特定参数，如缓存开关、算子内存限制等。
   std::shared_ptr<facebook::velox::config::ConfigBase> veloxCfg_;
+  // 调试模式标记。如果启用，会触发额外的日志记录或计划导出（Dumping）行为。
   bool debugModeEnabled_{false};
-
+  // 空 Schema Batch 缓存。在处理 count(*) 等不需要实际列数据的操作时，缓存并重复利用“空列”但带行数的 Batch，以优化性能。
   std::unordered_map<int32_t, std::shared_ptr<VeloxColumnarBatch>> emptySchemaBatchLoopUp_;
 };
 

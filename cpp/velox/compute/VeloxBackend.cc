@@ -73,6 +73,11 @@ using namespace facebook;
 namespace gluten {
 
 namespace {
+// 作用是根据给定的参数创建一个 VeloxMemoryManager 实例。
+// MemoryManager*: 函数返回一个指向 MemoryManager 基类的指针。这体现了多态性，因为 VeloxMemoryManager 是其子类。
+// const std::string& kind: 输入参数，表示内存管理器的类型（在 Velox 后端中通常传入字符串 "velox"）。
+// std::unique_ptr<AllocationListener> listener: 传入一个独占指针，指向内存分配监听器。
+// 这个监听器非常重要，它负责将 C++ 侧（Velox）分配的内存变化实时通知给 Java 侧（Spark），以便 Spark 能够进行内存配额管理。
 MemoryManager* veloxMemoryManagerFactory(const std::string& kind, std::unique_ptr<AllocationListener> listener) {
   return new VeloxMemoryManager(kind, std::move(listener), *VeloxBackend::get()->getBackendConf());
 }
@@ -80,7 +85,11 @@ MemoryManager* veloxMemoryManagerFactory(const std::string& kind, std::unique_pt
 void veloxMemoryManagerReleaser(MemoryManager* memoryManager) {
   delete memoryManager;
 }
-
+// 作用是实例化一个 Velox 运行环境（VeloxRuntime）。
+// Runtime 是 Gluten 中最核心的对象之一，它封装了执行单次查询任务（Task）所需的所有上下文信息
+// Runtime*: 返回指向基类 Runtime 的指针。这是 Gluten 插件化架构的体现，允许 Spark 动态加载不同的后端（如 Velox 或 ClickHouse）。
+// const std::string& kind: 后端类型的名称，对于 Velox 后端，通常传入 "velox"。
+// MemoryManager* memoryManager: 传入一个通用的内存管理器指针。这是上一步 veloxMemoryManagerFactory 创建的对象。
 Runtime* veloxRuntimeFactory(
     const std::string& kind,
     MemoryManager* memoryManager,
@@ -94,16 +103,19 @@ void veloxRuntimeReleaser(Runtime* runtime) {
   delete runtime;
 }
 } // namespace
-
+// 核心初始化函数 init。
+// 它负责在 Executor（执行器）启动时，将 Velox 引擎的所有全局组件（配置、内存、IO、文件系统、算子等）配置并注册到位。
 void VeloxBackend::init(
     std::unique_ptr<AllocationListener> listener,
     const std::unordered_map<std::string, std::string>& conf) {
+  // 将传入的 conf（来自 Spark）保存为 Velox 专用的 ConfigBase 对象。
   backendConf_ =
       std::make_shared<facebook::velox::config::ConfigBase>(std::unordered_map<std::string, std::string>(conf));
-
+  // 实例化全局内存管理器。这是 Gluten C++ 侧管理堆外内存的起点。
   globalMemoryManager_ = std::make_unique<VeloxMemoryManager>(kVeloxBackendKind, std::move(listener), *backendConf_);
 
   // Register factories.
+  // 将我们之前分析过的 veloxMemoryManagerFactory 和 veloxRuntimeFactory 注册到 Gluten 的工厂注册表中。这样当 Java 端请求创建内存或运行时环境时，系统知道该调用哪些 Velox 专用的函数。
   MemoryManager::registerFactory(kVeloxBackendKind, veloxMemoryManagerFactory, veloxMemoryManagerReleaser);
   Runtime::registerFactory(kVeloxBackendKind, veloxRuntimeFactory, veloxRuntimeReleaser);
 
@@ -112,6 +124,7 @@ void VeloxBackend::init(
   }
 
   // Init glog and log level.
+  // 初始化 Google 的 glog 库。
   if (!backendConf_->get<bool>(kDebugModeEnabled, false)) {
     FLAGS_v = backendConf_->get<uint32_t>(kGlogVerboseLevel, kGlogVerboseLevelDefault);
     FLAGS_minloglevel = backendConf_->get<uint32_t>(kGlogSeverityLevel, kGlogSeverityLevelDefault);
@@ -122,6 +135,7 @@ void VeloxBackend::init(
       FLAGS_v = kGlogVerboseLevelMaximum;
     }
   }
+  // FLAGS_logtostderr = true：强制将日志输出到标准错误流，以便 Spark 能够捕获 Native 侧的日志。
   FLAGS_logtostderr = true;
   google::InitGoogleLogging("gluten");
 
@@ -153,8 +167,9 @@ void VeloxBackend::init(
   auto hiveConf = createHiveConnectorConfig(backendConf_);
 
   // Setup and register.
+  // 注册本地文件系统
   velox::filesystems::registerLocalFileSystem();
-
+  // 条件编译注册 (HDFS/S3/GCS/ABFS)：根据编译宏，启用对分布式文件系统的支持。例如，如果开启了 ENABLE_S3，Velox 就能通过 s3:// 协议读取数据。
 #ifdef ENABLE_HDFS
   velox::filesystems::registerHdfsFileSystem();
 #endif
@@ -186,6 +201,7 @@ void VeloxBackend::init(
 #endif
 
   initJolFilesystem();
+  // 注册 Hive 连接器，这是处理 Spark SQL 任务（Parquet/ORC 文件）的核心。
   initConnector(hiveConf);
 
   velox::dwio::common::registerFileSinks();

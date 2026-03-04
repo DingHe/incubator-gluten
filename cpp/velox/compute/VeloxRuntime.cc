@@ -81,10 +81,13 @@ VeloxRuntime::VeloxRuntime(
   FLAGS_velox_memory_pool_capacity_transfer_across_tasks = veloxCfg_->get<bool>(
       kMemoryPoolCapacityTransferAcrossTasks, FLAGS_velox_memory_pool_capacity_transfer_across_tasks);
 }
-
+// Substrait 计划解析入口
+// 职责是接收从 Spark JVM 端传来的二进制 Protobuf 数据，将其还原为内存中的计划对象，并根据配置提供调试和自省能力。
 void VeloxRuntime::parsePlan(const uint8_t* data, int32_t size) {
+  // 调试与日志转储逻辑 (Debug & Dump)
   if (debugModeEnabled_ || dumper_ != nullptr) {
     try {
+      // 将二进制的 Protobuf 计划转换为人类可读的 JSON 字符串。
       auto planJson = substraitFromPbToJson("Plan", data, size);
       if (dumper_ != nullptr) {
         dumper_->dumpPlan(planJson);
@@ -97,7 +100,7 @@ void VeloxRuntime::parsePlan(const uint8_t* data, int32_t size) {
       LOG(WARNING) << "Error converting substrait::Plan to JSON: " << e.what();
     }
   }
-
+  // 调用 Protobuf 库的反序列化函数，将字节数组 data 映射到 VeloxRuntime 继承自父类的成员变量 substraitPlan_ 中
   GLUTEN_CHECK(parseProtobuf(data, size, &substraitPlan_) == true, "Parse substrait plan failed");
 }
 
@@ -163,12 +166,13 @@ VeloxMemoryManager* VeloxRuntime::memoryManager() {
   GLUTEN_CHECK(vmm != nullptr, "Not a Velox memory manager");
   return vmm;
 }
-
+// 标志着从“计划转换”到“引擎执行”的跃迁。它的作用是根据之前解析好的 Substrait 计划，构建出真正的 Velox 执行管线（Pipeline） 并返回一个结果迭代器。
 std::shared_ptr<ResultIterator> VeloxRuntime::createResultIterator(
     const std::string& spillDir,
     const std::vector<std::shared_ptr<ResultIterator>>& inputs) {
   LOG_IF(INFO, debugModeEnabled_) << "VeloxRuntime session config:" << printConfig(confMap_);
-
+  // 实例化 VeloxPlanConverter，将逻辑上的 substraitPlan_ 翻译成 Velox 内部的物理计划树 veloxPlan_。
+  // 输入：Substrait 计划、输入迭代器（inputs）、本地写文件的临时路径等。
   VeloxPlanConverter veloxPlanConverter(
       memoryManager()->getLeafMemoryPool().get(),
       veloxCfg_.get(),
@@ -186,8 +190,12 @@ std::shared_ptr<ResultIterator> VeloxRuntime::createResultIterator(
   std::vector<velox::core::PlanNodeId> streamIds;
 
   // Separate the scan ids and stream ids, and get the scan infos.
+  // scanIds & scanInfos：代表需要从外部文件（如 Parquet）读取数据的节点。
+  // streamIds：代表需要从上游迭代器（通常是 Shuffle 或其他 Runtime）获取数据的节点。
+  // 目的：Velox 的 Task 需要知道哪些是叶子节点（Leaf Nodes），以便为其分配具体的 Split（数据分片）。
   getInfoAndIds(veloxPlanConverter.splitInfos(), veloxPlan_->leafPlanNodeIds(), scanInfos, scanIds, streamIds);
-
+  // 作用：创建 WholeStageResultIterator。
+  // 这是 Gluten 封装的最高级迭代器，其内部会真正初始化 Velox 的 Task 和 ExecCtx。
   auto wholeStageIter = std::make_unique<WholeStageResultIterator>(
       memoryManager(),
       veloxPlan_,
@@ -197,7 +205,7 @@ std::shared_ptr<ResultIterator> VeloxRuntime::createResultIterator(
       spillDir,
       veloxCfg_,
       taskInfo_.has_value() ? taskInfo_.value() : SparkTaskInfo{});
-
+  // 如果有一些输入迭代器没有被直接集成进物理计划树中，它们会被包装成特殊的 Split 添加到任务里。这确保了所有数据源都能被统一的调度器处理。
   auto remainingInputIterators = veloxPlanConverter.remainingInputIterators();
   if (!remainingInputIterators.empty()) {
   // Converts remaining input iterators to splits and add them to the task.
